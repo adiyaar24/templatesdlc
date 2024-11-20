@@ -1,0 +1,1044 @@
+pipeline:
+  name: Template SDLC
+  identifier: Template_SDLC
+  projectIdentifier: Local_Testing
+  orgIdentifier: default
+  tags: {}
+  stages:
+    - stage:
+        name: Template Upgrade
+        identifier: Template_Upgrade
+        description: ""
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - stepGroup:
+                  name: Download and Analyze
+                  identifier: Download_and_Analyze
+                  steps:
+                    - step:
+                        type: ShellScript
+                        name: Build Querystring
+                        identifier: Build_Querystring
+                        spec:
+                          shell: Bash
+                          executionTarget: {}
+                          source:
+                            type: Inline
+                            spec:
+                              script: |
+                                set -eo pipefail
+                                echo "Preparing Query String"
+                                output_string="?accountIdentifier=${ACCOUNT_ID}"
+                                if [[ ${PROJECT_ID} ]]; then
+                                  if [[ -z ${ORG_ID} ]]; then
+                                    echo "Organization must be provided if selecting a Project Identifier"
+                                    exit 255
+                                  fi
+                                fi
+                                if [[ ${ORG_ID} ]]; then
+                                  output_string="${output_string}&orgIdentifier=${ORG_ID}"
+                                  if [[ ${PROJECT_ID} ]]; then
+                                    output_string="${output_string}&projectIdentifier=${PROJECT_ID}"
+                                  fi
+                                fi
+
+                                echo "${output_string}"
+                          environmentVariables:
+                            - name: ACCOUNT_ID
+                              value: <+stepGroup.variables.account_id>
+                              type: String
+                            - name: ORG_ID
+                              value: <+stepGroup.variables.organization_id>
+                              type: String
+                            - name: PROJECT_ID
+                              value: <+stepGroup.variables.project_id>
+                              type: String
+                          outputVariables:
+                            - name: QUERYSTRING
+                              type: String
+                              value: output_string
+                        timeout: 10m
+                    - step:
+                        type: Http
+                        name: Download the Template Yaml
+                        identifier: Download_the_Template_Yaml
+                        spec:
+                          url: <+spec.inputVariables.HARNESS_ENDPOINT>/template/api/templates/<+spec.inputVariables.TEMPLATE_ID><+spec.inputVariables.QUERYSTRING>&versionLabel=<+spec.inputVariables.TEMPLATE_VERSION>
+                          method: GET
+                          headers:
+                            - key: x-api-key
+                              value: <+stepGroup.variables.harness_platform_key>
+                          inputVariables:
+                            - name: HARNESS_ENDPOINT
+                              value: <+stepGroup.variables.harness_account_url>
+                              type: String
+                            - name: QUERYSTRING
+                              value: <+stepGroup.steps.Build_Querystring.output.outputVariables.QUERYSTRING>
+                              type: String
+                            - name: TEMPLATE_ID
+                              value: <+stepGroup.variables.template_id>
+                              type: String
+                            - name: TEMPLATE_VERSION
+                              value: <+stepGroup.variables.template_version>
+                              type: String
+                          outputVariables:
+                            - name: PAYLOAD
+                              value: <+json.format(httpResponseBody)>
+                              type: String
+                          requestBody: ""
+                          assertion: <+httpResponseCode>==200
+                        timeout: 10s
+                    - step:
+                        type: ShellScript
+                        name: Convert Yaml to JSON
+                        identifier: Convert_Yaml_to_JSON
+                        spec:
+                          shell: Bash
+                          executionTarget: {}
+                          source:
+                            type: Inline
+                            spec:
+                              script: |
+                                #!/bin/bash
+                                set -eo pipefail
+                                OLDPWD=${PWD}
+                                WORKING_FILE="${PWD}/deployment_${TEMPLATE_ID}_$RANDOM"
+                                trap "cd ${OLDPWD};rm -rf $WORKING_FILE*" EXIT
+
+                                mkdir -p ${WORKING_FILE}
+                                cd ${WORKING_FILE}
+
+                                # Function to handle errors with a custom message and exit code
+                                error_exit() {
+                                  echo "Error: $1"
+                                  exit $2
+                                }
+
+                                # Ensure necessary commands are available
+                                command -v yq >/dev/null 2>&1 || error_exit "yq is not installed." 127
+                                command -v jq >/dev/null 2>&1 || error_exit "jq is not installed." 127
+
+                                # Check if YAML variable is set and non-empty
+                                echo '<+stepGroup.steps.Download_the_Template_Yaml.output.outputVariables.PAYLOAD>' > payload.json
+                                cat payload.json | jq -r '.data.yaml' > data.yaml || error_exit "Failed to write YAML to data.yaml." 1
+
+                                # Convert YAML to JSON
+                                yq eval -o=json data.yaml > data.json || error_exit "Failed to convert YAML to JSON." 2
+
+                                # Parse JSON for template counts and unique template references
+                                template_count=$(jq '[.. | objects | select(has("template") and (.template.templateRef != null)) | .template.templateRef] | length' data.json) || error_exit "Failed to extract template count from JSON." 3
+                                unique_template_details=$(jq -r '[.. | objects | select(has("template") and (.template.templateRef != null)) | {"ref":.template.templateRef,"ver":(if .template.versionLabel != null  then .template.versionLabel else "stable" end)}]' data.json) || error_exit "Failed to extract unique template references from JSON." 4
+                                unique_template_refs=$(jq -r '[.. | objects | select(has("template") and (.template.templateRef != null)) | .template.templateRef] | unique | join(",")' data.json) || error_exit "Failed to extract unique template references from JSON." 4
+
+                                # Determine if rerun is needed
+                                if [ "$template_count" -gt 0 ]; then
+                                  need_to_rerun=true
+                                else
+                                  need_to_rerun=false
+                                  template_count=0
+                                fi
+
+                                # Output the result
+                                echo "need_to_rerun=$need_to_rerun"
+                                echo "template_count=$template_count"
+
+                                if [ "$need_to_rerun" = true ]; then
+                                  echo "Unique templateRef values:"
+                                  echo "[$unique_template_refs]"
+                                fi
+
+                                # Export variables
+                                export UNIQUE_TEMPLATE_REFS="$unique_template_refs"
+                                export UNIQUE_TEMPLATE_DETAILS="$unique_template_details"
+                                export CHECK_DEPENDENCY="$need_to_rerun"
+                                export CURRENT_YAML=$(jq -c '.' data.json)
+                          environmentVariables:
+                            - name: TEMPLATE_ID
+                              type: String
+                              value: <+stepGroup.variables.template_id>
+                            - name: PAYLOAD
+                              type: String
+                              value: <+stepGroup.steps.Download_the_Template_Yaml.output.outputVariables.PAYLOAD>
+                          outputVariables:
+                            - name: CHECK_DEPENDENCY
+                              type: String
+                              value: CHECK_DEPENDENCY
+                            - name: UNIQUE_TEMPLATE_REFS
+                              type: String
+                              value: UNIQUE_TEMPLATE_REFS
+                            - name: UNIQUE_TEMPLATE_DETAILS
+                              type: String
+                              value: UNIQUE_TEMPLATE_DETAILS
+                            - name: CURRENT_YAML
+                              type: String
+                              value: CURRENT_YAML
+                        timeout: 10m
+                    - step:
+                        type: ShellScript
+                        name: Update References in YAML
+                        identifier: Update_References_in_YAML
+                        spec:
+                          shell: Bash
+                          executionTarget: {}
+                          source:
+                            type: Inline
+                            spec:
+                              script: |
+                                #!/bin/bash
+                                set -eo pipefail
+                                OLDPWD=${PWD}
+                                WORKING_FILE="${PWD}/deployment_${TEMPLATE_ID}"
+                                trap "cd ${OLDPWD};rm -rf $WORKING_FILE*" EXIT
+
+                                mkdir -p ${WORKING_FILE}
+                                cd ${WORKING_FILE}
+
+                                # Function to handle errors with a custom message and exit code
+                                error_exit() {
+                                  echo "Error: $1"
+                                  exit $2
+                                }
+
+                                # Ensure necessary commands are available
+                                command -v yq >/dev/null 2>&1 || error_exit "yq is not installed." 127
+                                command -v jq >/dev/null 2>&1 || error_exit "jq is not installed." 127
+
+                                # Check if YAML variable is set and non-empty
+                                echo '<+stepGroup.steps.Convert_Yaml_to_JSON.output.outputVariables.CURRENT_YAML>' > payload.json
+                                # Check if the data.json file exists
+                                input_file="payload.json"
+
+                                # Check if the data.json file exists
+                                if [ ! -f "$input_file" ]; then
+                                  echo "Error: $input_file not found!"
+                                  exit 1
+                                fi
+
+                                # Perform the replacement using jq
+                                modified_json=$(jq --arg promoteTo "${PROMOTE_TO}" '
+                                  # Define the logic for determining if the value should be replaced
+                                  def should_replace(value):
+                                    if (value == null or (value | type != "string")) then
+                                      false  # Do not replace if the value is null or not a string
+                                    elif ($promoteTo == "account" and (value | startswith("account."))) or
+                                          ($promoteTo == "org" and (value | startswith("org."))) then
+                                      false  # Do not replace if the condition matches
+                                    else
+                                      true   # Replace if the condition does not match
+                                    end;
+                                  # Template Ref 
+                                  def update_template_ref(value):
+                                    if ($promoteTo == "account" and (value | startswith("account."))) or
+                                        ($promoteTo == "org" and (value | startswith("org."))) then
+                                      value  # No change needed if it already starts with promoteTo
+                                    elif $promoteTo == "account" then
+                                      "account." + (value | ltrimstr("org."))  # Prepend account and remove any org prefix
+                                    elif $promoteTo == "org" then
+                                      "org." + (value | ltrimstr("account."))  # Prepend org and remove any account prefix
+                                    else
+                                      value  # Fallback: leave unchanged
+                                    end;
+
+
+                                    (.. | objects | select(has("connectorRef")) | .connectorRef) |= 
+                                    if should_replace(.) then ("<" + "+" + "input" + ">") else . end |
+                                  (.. | objects | select(has("secret")) | .secret) |= 
+                                    if should_replace(.) then ("<" + "+" + "input" + ">") else . end |
+                                    (.. | objects | select(has("templateRef")) | .templateRef) |= 
+                                    update_template_ref(.)
+                                ' "$input_file")
+
+
+
+                                if [ "$PROMOTE_TO" == "account" ]; then
+                                  # Remove "orgIdentifier" and "projectIdentifier" recursively from the modified JSON
+                                  modified_json=$(echo "$modified_json" | jq 'del(.. | .orgIdentifier?, .projectIdentifier?)')
+                                elif [ "$PROMOTE_TO" == "org" ]; then
+                                  # Remove "projectIdentifier" recursively from the modified JSON
+                                  modified_json=$(echo "$modified_json" | jq 'del(.. | .projectIdentifier?)')
+                                fi
+
+
+                                # Check if jq executed successfully
+                                if [ $? -ne 0 ]; then
+                                  echo "Error: Failed to process JSON with jq"
+                                  exit 1
+                                fi
+
+                                # Print the modified JSON for debugging
+                                echo "Modified JSON:"
+                                echo "$modified_json" | jq .
+
+                                # Save the modified JSON to a temporary file
+                                echo "$modified_json" > modified_data.json
+
+                                # Convert the modified JSON to YAML using yq
+                                echo "Converted YAML:"
+                                converted_yaml=$(echo "$modified_json" | yq eval -P -)
+                                echo "$converted_yaml"
+
+
+                                # Convert YAML To String
+                                yaml_string=$(echo "$converted_yaml" | sed 's^"^\\"^g' | awk '{printf "%s\\n", $0}')
+                                echo "String Version"
+                                echo "$yaml_string"
+
+                                export CONVERTED_STRING="$yaml_string"
+                                export MODIFIED_JSON="$modified_json"
+                                export CONVERTED_YAML="$converted_yaml"
+                          environmentVariables:
+                            - name: TEMPLATE_ID
+                              type: String
+                              value: <+stepGroup.variables.template_id>
+                            - name: PROMOTE_TO
+                              type: String
+                              value: <+stepGroup.variables.promote_to>
+                          outputVariables:
+                            - name: CONVERTED_YAML
+                              type: String
+                              value: CONVERTED_YAML
+                            - name: MODIFIED_JSON
+                              type: String
+                              value: MODIFIED_JSON
+                            - name: CONVERTED_STRING
+                              type: String
+                              value: CONVERTED_STRING
+                        timeout: 10m
+                  variables:
+                    - name: harness_account_url
+                      type: String
+                      value: <+stage.variables.harness_account_url>
+                      description: ""
+                      required: false
+                    - name: harness_platform_key
+                      type: String
+                      value: <+stage.variables.harness_platform_key>
+                      description: ""
+                      required: false
+                    - name: account_id
+                      description: Provide the Harness Account ID associated with the provided Platform Key
+                      type: String
+                      value: <+stage.variables.harness_platform_account>
+                    - name: organization_id
+                      description: Provide the Harness Organization ID from which the Template will be retrieved
+                      type: String
+                      value: <+stage.variables.organization_id>
+                    - name: project_id
+                      description: Provide the Harness Project ID from which the Template will be retrieved
+                      type: String
+                      value: <+stage.variables.project_id>
+                    - name: template_id
+                      description: Provide the Harness Template ID to retrieve
+                      type: String
+                      value: <+stage.variables.template_id>
+                    - name: template_version
+                      description: Provide the Harness Template Version ID to retrieve
+                      type: String
+                      value: <+stage.variables.template_version>
+                    - name: promote_to
+                      description: Provide the Harness Template Version ID to retrieve
+                      type: String
+                      value: <+stage.variables.promote_to>
+              - stepGroup:
+                  name: Evaluate Template Dependencies
+                  identifier: Evaluate_Template_Dependencies
+                  steps:
+                    - step:
+                        type: ShellScript
+                        name: Build Querystring
+                        identifier: Build_Querystring
+                        spec:
+                          shell: Bash
+                          executionTarget: {}
+                          source:
+                            type: Inline
+                            spec:
+                              script: |
+                                set -eo pipefail
+                                echo "Preparing Query String"
+                                if [[ ${PROJECT_ID} ]]; then
+                                  if [[ -z ${ORG_ID} ]]; then
+                                    echo "Organization must be provided if selecting a Project Identifier"
+                                    exit 255
+                                  fi
+                                fi
+                                output_string="/v1"
+                                if [[ ${ORG_ID} ]]; then
+                                  output_string="${output_string}/orgs/${ORG_ID}"
+                                  if [[ ${PROJECT_ID} ]]; then
+                                    output_string="${output_string}/projects/${PROJECT_ID}"
+                                  fi
+                                fi
+                                output_string="${output_string}/templates?identifiers=${TEMPLATE_ID}"
+                          environmentVariables:
+                            - name: ACCOUNT_ID
+                              value: <+stepGroup.variables.account_id>
+                              type: String
+                            - name: ORG_ID
+                              value: <+<+pipeline.variables.promote_to> == "org" ?<+stepGroup.variables.organization_id> :"">
+                              type: String
+                            - name: PROJECT_ID
+                              value: <+<+pipeline.variables.promote_to> == "project" ?<+stepGroup.variables.project_id> :"">
+                              type: String
+                            - name: TEMPLATE_ID
+                              value: <+stepGroup.variables.template_id>
+                              type: String
+                            - name: TEMPLATE_VERSION
+                              value: <+stepGroup.variables.template_version>
+                              type: String
+                          outputVariables:
+                            - name: QUERYSTRING
+                              type: String
+                              value: output_string
+                        timeout: 10m
+                    - step:
+                        type: Http
+                        name: Return Templates in Scope
+                        identifier: Return_Templates_in_Scope
+                        spec:
+                          url: <+spec.inputVariables.HARNESS_ENDPOINT><+spec.inputVariables.QUERYSTRING>
+                          method: GET
+                          headers:
+                            - key: x-api-key
+                              value: <+stepGroup.variables.harness_platform_key>
+                            - key: Harness-Account
+                              value: cNx_OWAtRhuiCWYmzqjqQQ
+                          inputVariables:
+                            - name: HARNESS_ENDPOINT
+                              value: <+stepGroup.variables.harness_account_url>
+                              type: String
+                            - name: ACCOUNT_ID
+                              value: <+stepGroup.variables.account_id>
+                              type: String
+                            - name: QUERYSTRING
+                              value: <+stepGroup.steps.Build_Querystring.output.outputVariables.QUERYSTRING>
+                              type: String
+                          outputVariables:
+                            - name: PAYLOAD
+                              value: <+json.format(httpResponseBody)>
+                              type: String
+                          requestBody: ""
+                          assertion: <+httpResponseCode>==200
+                        timeout: 10s
+                    - step:
+                        type: ShellScript
+                        name: Verify Template and Version
+                        identifier: Verify_Template_and_Version
+                        spec:
+                          shell: Bash
+                          executionTarget: {}
+                          source:
+                            type: Inline
+                            spec:
+                              script: |
+                                #!/bin/bash
+                                set -eo pipefail
+                                OLDPWD=${PWD}
+                                WORKING_FILE="${PWD}/deployment_${TEMPLATE_ID}"
+                                trap "cd ${OLDPWD};rm -rf $WORKING_FILE*" EXIT
+
+                                mkdir -p ${WORKING_FILE}
+                                cd ${WORKING_FILE}
+
+                                # Function to handle errors with a custom message and exit code
+                                error_exit() {
+                                  echo "Error: $1"
+                                  exit $2
+                                }
+                                echo '<+stepGroup.steps.Return_Templates_in_Scope.output.httpResponseBody>' > payload.json
+                                if [[ ${TEMPLATE_VERSION} == stable ]]; then
+                                  jq --arg tpl ${TEMPLATE_ID} '.|map(select(.identifier==$tpl))|map(select(.stable_template==true))' payload.json
+                                  template_exists=$(jq --arg tpl ${TEMPLATE_ID} '.|map(select(.identifier==$tpl))|map(select(.stable_template==true))|length' payload.json)
+                                else
+                                  template_exists=$(jq --arg tpl ${TEMPLATE_ID} --arg tpv ${TEMPLATE_VERSION} '.|map(select(.identifier==$tpl))|map(select(.version_label==$tpv))|length' payload.json)
+                                fi
+
+                                if [ "$template_exists" -gt 0 ]; then
+                                  template_exists=true
+                                else
+                                  template_exists=false
+                                fi
+                          environmentVariables:
+                            - name: TEMPLATE_ID
+                              value: <+stepGroup.variables.template_id>
+                              type: String
+                            - name: TEMPLATE_VERSION
+                              value: <+stepGroup.variables.template_version>
+                              type: String
+                          outputVariables:
+                            - name: TEMPLATE_FOUND
+                              type: String
+                              value: template_exists
+                        timeout: 10m
+                    - step:
+                        type: Barrier
+                        name: Process Gate
+                        identifier: Process_Gate
+                        spec:
+                          barrierRef: template_evaluation
+                        timeout: 10m
+                    - step:
+                        type: ShellScript
+                        name: Process Template Readiness
+                        identifier: Process_Template_Readiness
+                        spec:
+                          shell: Bash
+                          executionTarget: {}
+                          source:
+                            type: Inline
+                            spec:
+                              script: |
+                                if [[ "<+stepGroup.steps.Verify_Template_and_Version.output.outputVariables.TEMPLATE_FOUND>" != "true" ]]; then
+                                  echo "Required Template Missing"
+                                  exit 299
+                                fi
+                          environmentVariables: []
+                          outputVariables: []
+                        timeout: 10m
+                  variables:
+                    - name: harness_account_url
+                      type: String
+                      value: <+stage.variables.harness_account_url>
+                      description: ""
+                      required: false
+                    - name: harness_platform_key
+                      type: String
+                      value: <+stage.variables.harness_platform_key>
+                      description: ""
+                      required: false
+                    - name: account_id
+                      description: Provide the Harness Account ID associated with the provided Platform Key
+                      type: String
+                      value: <+stage.variables.harness_platform_account>
+                    - name: organization_id
+                      description: Provide the Harness Organization ID from which the Template will be retrieved
+                      type: String
+                      value: <+stage.variables.organization_id>
+                    - name: project_id
+                      description: Provide the Harness Project ID from which the Template will be retrieved
+                      type: String
+                      value: <+stage.variables.project_id>
+                    - name: template_id
+                      description: Provide the Harness Template ID to retrieve
+                      type: String
+                      value: <+json.list("$",<+execution.steps.Download_and_Analyze.steps.Convert_Yaml_to_JSON.output.outputVariables.UNIQUE_TEMPLATE_DETAILS>).get(<+strategy.iteration>).ref>
+                    - name: template_version
+                      description: Provide the Harness Template Version ID to retrieve
+                      type: String
+                      value: <+json.list("$",<+execution.steps.Download_and_Analyze.steps.Convert_Yaml_to_JSON.output.outputVariables.UNIQUE_TEMPLATE_DETAILS>).get(<+strategy.iteration>).ver>
+                  strategy:
+                    repeat:
+                      items: <+<+execution.steps.Download_and_Analyze.steps.Convert_Yaml_to_JSON.output.outputVariables.UNIQUE_TEMPLATE_REFS>.split(',')>
+                  when:
+                    stageStatus: Success
+                    condition: <+execution.steps.Download_and_Analyze.steps.Convert_Yaml_to_JSON.output.outputVariables.CHECK_DEPENDENCY> == "true"
+              - stepGroup:
+                  name: Promotion Validation and Approval
+                  identifier: Promotion_Conflict_Handler
+                  steps:
+                    - step:
+                        type: ShellScript
+                        name: Build Querystring
+                        identifier: Build_Querystring
+                        spec:
+                          shell: Bash
+                          executionTarget: {}
+                          source:
+                            type: Inline
+                            spec:
+                              script: |
+                                set -eo pipefail
+                                echo "Preparing Query String"
+                                if [[ ${PROJECT_ID} ]]; then
+                                  if [[ -z ${ORG_ID} ]]; then
+                                    echo "Organization must be provided if selecting a Project Identifier"
+                                    exit 255
+                                  fi
+                                fi
+                                output_string="/v1"
+                                if [[ ${ORG_ID} ]]; then
+                                  output_string="${output_string}/orgs/${ORG_ID}"
+                                  if [[ ${PROJECT_ID} ]]; then
+                                    output_string="${output_string}/projects/${PROJECT_ID}"
+                                  fi
+                                fi
+                                template_string="${output_string}/templates/${TEMPLATE_ID}/versions/${TEMPLATE_VERSION}"
+                                output_string="${output_string}/templates?identifiers=${TEMPLATE_ID}"
+                          environmentVariables:
+                            - name: ACCOUNT_ID
+                              value: <+stepGroup.variables.account_id>
+                              type: String
+                            - name: ORG_ID
+                              value: <+<+pipeline.variables.promote_to> == "org" ?<+stepGroup.variables.organization_id> :"">
+                              type: String
+                            - name: PROJECT_ID
+                              value: <+<+pipeline.variables.promote_to> == "project" ?<+stepGroup.variables.project_id> :"">
+                              type: String
+                            - name: TEMPLATE_ID
+                              value: <+stepGroup.variables.template_id>
+                              type: String
+                            - name: TEMPLATE_VERSION
+                              value: <+stepGroup.variables.template_version>
+                              type: String
+                          outputVariables:
+                            - name: QUERYSTRING
+                              type: String
+                              value: output_string
+                            - name: TEMPLATE_QUERYSTRING
+                              type: String
+                              value: template_string
+                        timeout: 10m
+                    - step:
+                        type: Http
+                        name: Return Templates in New Scope
+                        identifier: Return_Templates_in_New_Scope
+                        spec:
+                          url: <+spec.inputVariables.HARNESS_ENDPOINT><+spec.inputVariables.QUERYSTRING>
+                          method: GET
+                          headers:
+                            - key: x-api-key
+                              value: <+stepGroup.variables.harness_platform_key>
+                            - key: Harness-Account
+                              value: <+stepGroup.variables.account_id>
+                          inputVariables:
+                            - name: HARNESS_ENDPOINT
+                              value: <+stepGroup.variables.harness_account_url>
+                              type: String
+                            - name: ACCOUNT_ID
+                              value: <+stepGroup.variables.account_id>
+                              type: String
+                            - name: QUERYSTRING
+                              value: <+stepGroup.steps.Build_Querystring.output.outputVariables.QUERYSTRING>
+                              type: String
+                          outputVariables:
+                            - name: PAYLOAD
+                              value: <+json.format(httpResponseBody)>
+                              type: String
+                          requestBody: ""
+                          assertion: <+httpResponseCode>==200
+                        timeout: 10s
+                    - step:
+                        type: ShellScript
+                        name: Verify Template and Version
+                        identifier: Verify_Template_and_Version
+                        spec:
+                          shell: Bash
+                          executionTarget: {}
+                          source:
+                            type: Inline
+                            spec:
+                              script: |
+                                #!/bin/bash
+                                set -eo pipefail
+                                OLDPWD=${PWD}
+                                WORKING_FILE="${PWD}/deployment_${TEMPLATE_ID}"
+                                trap "cd ${OLDPWD};rm -rf $WORKING_FILE*" EXIT
+
+                                mkdir -p ${WORKING_FILE}
+                                cd ${WORKING_FILE}
+
+                                # Function to handle errors with a custom message and exit code
+                                error_exit() {
+                                  echo "Error: $1"
+                                  exit $2
+                                }
+                                echo '<+stepGroup.steps.Return_Templates_in_New_Scope.output.httpResponseBody>' > payload.json
+                                if [[ ${TEMPLATE_VERSION} == stable ]]; then
+                                  jq --arg tpl ${TEMPLATE_ID} '.|map(select(.identifier==$tpl))|map(select(.stable_template==true))' payload.json
+                                  template_payload=$(jq --arg tpl ${TEMPLATE_ID} '.|map(select(.identifier==$tpl))|map(select(.stable_template==true))' payload.json)
+                                else
+                                  template_payload=$(jq --arg tpl ${TEMPLATE_ID} --arg tpv ${TEMPLATE_VERSION} '.|map(select(.identifier==$tpl))|map(select(.version_label==$tpv))' payload.json)
+                                fi
+                                template_exists=$(echo $template_payload | jq '.|length')
+
+                                if [ "$template_exists" -gt 0 ]; then
+                                  template_exists=true
+                                  template_payload=$(echo $template_payload | jq -c 'first')
+                                else
+                                  template_exists=false
+                                fi
+                          environmentVariables:
+                            - name: TEMPLATE_ID
+                              value: <+stepGroup.variables.template_id>
+                              type: String
+                            - name: TEMPLATE_VERSION
+                              value: <+stepGroup.variables.template_version>
+                              type: String
+                          outputVariables:
+                            - name: TEMPLATE_PAYLOAD
+                              type: String
+                              value: template_payload
+                            - name: TEMPLATE_FOUND
+                              type: String
+                              value: template_exists
+                        timeout: 10m
+                    - step:
+                        type: Http
+                        name: Download the Current Template Yaml
+                        identifier: Download_the_Current_Template_Yaml
+                        spec:
+                          url: <+spec.inputVariables.HARNESS_ENDPOINT><+spec.inputVariables.QUERYSTRING>
+                          method: GET
+                          headers:
+                            - key: x-api-key
+                              value: <+stepGroup.variables.harness_platform_key>
+                          inputVariables:
+                            - name: HARNESS_ENDPOINT
+                              value: <+stepGroup.variables.harness_account_url>
+                              type: String
+                            - name: QUERYSTRING
+                              value: <+stepGroup.steps.Build_Querystring.output.outputVariables.TEMPLATE_QUERYSTRING>
+                              type: String
+                          outputVariables:
+                            - name: PAYLOAD
+                              value: <+json.format(httpResponseBody)>
+                              type: String
+                          requestBody: ""
+                          assertion: <+httpResponseCode>==200
+                        timeout: 10s
+                    - step:
+                        type: ShellScript
+                        name: Evaluate Conflicts
+                        identifier: Evaluate_Conflicts
+                        spec:
+                          shell: Bash
+                          executionTarget: {}
+                          source:
+                            type: Inline
+                            spec:
+                              script: |
+                                #!/bin/bash
+                                set -exo pipefail
+                                OLDPWD=${PWD}
+                                WORKING_FILE="${PWD}/deployment_${TEMPLATE_ID}"
+                                trap "cd ${OLDPWD};rm -rf $WORKING_FILE*" EXIT
+
+                                mkdir -p ${WORKING_FILE}
+                                cd ${WORKING_FILE}
+
+                                # Check if YAML variable is set and non-empty
+                                echo '<+stepGroup.steps.Download_the_Current_Template_Yaml.output.outputVariables.PAYLOAD>' | jq -r '.template.yaml' | yq e -oj > current_payload.json
+                                echo '<+stepGroup.variables.update_payload>' | jq -r '.' > update_payload.json
+
+                                # diff_output=$(diff <(jq --sort-keys . current_payload.json) <(jq --sort-keys . update_payload.json))
+                                diff_output=$(jq --argfile a current_payload.json --argfile b update_payload.json -n 'def post_recurse(f): 
+                                  def r: (f | select(. != null) | r), .; r; def post_recurse: post_recurse(.[]?);
+                                  ($a | (post_recurse | arrays) |= sort) as $a | ($b | (post_recurse | arrays) |= sort) as $b | $a == $b'
+                                )
+
+                                echo $diff_output
+
+                                # Check if there are actual content differences
+                                if [ -z "$diff_output" ]; then
+                                  export DIFF=false
+                                  echo "YAMLs are identical (ignoring spaces and formatting)."
+                                else
+                                  echo "Differences found between the YAMLs:"
+                                  echo "$diff_output"
+                                  export DIFF=true
+                                  export MESSAGE="There is a conflicting Template with same identifier and that has difference , please review before approving"
+                                  export current_payload=$(cat current_payload.json)
+                                  export update_payload=$(cat update_payload.json)
+                                fi
+                          environmentVariables: []
+                          outputVariables:
+                            - name: DIFF
+                              type: String
+                              value: DIFF
+                            - name: MESSAGE
+                              type: String
+                              value: MESSAGE
+                            - name: CURRENT
+                              type: String
+                              value: current_payload
+                            - name: UPDATE
+                              type: String
+                              value: update_payload
+                        timeout: 10m
+                        failureStrategies:
+                          - onFailure:
+                              errors:
+                                - AllErrors
+                              action:
+                                type: ManualIntervention
+                                spec:
+                                  timeout: 1d
+                                  onTimeout:
+                                    action:
+                                      type: Abort
+                        when:
+                          stageStatus: Success
+                          condition: <+stepGroup.steps.Verify_Template_and_Version.output.outputVariables.TEMPLATE_FOUND> == "true"
+                  when:
+                    stageStatus: Success
+                  variables:
+                    - name: harness_account_url
+                      type: String
+                      value: <+stage.variables.harness_account_url>
+                      description: ""
+                      required: false
+                    - name: harness_platform_key
+                      type: String
+                      value: <+stage.variables.harness_platform_key>
+                      description: ""
+                      required: false
+                    - name: account_id
+                      description: Provide the Harness Account ID associated with the provided Platform Key
+                      type: String
+                      value: <+stage.variables.harness_platform_account>
+                    - name: organization_id
+                      description: Provide the Harness Organization ID from which the Template will be retrieved
+                      type: String
+                      value: <+stage.variables.organization_id>
+                    - name: project_id
+                      description: Provide the Harness Project ID from which the Template will be retrieved
+                      type: String
+                      value: <+stage.variables.project_id>
+                    - name: template_id
+                      description: Provide the Harness Template ID to retrieve
+                      type: String
+                      value: <+stage.variables.template_id>
+                    - name: template_version
+                      description: Provide the Harness Template Version ID to retrieve
+                      type: String
+                      value: <+stage.variables.template_version>
+                    - name: current_payload
+                      description: Current Template Payload
+                      type: String
+                      value: <+stepGroup.steps.Download_the_Current_Template_Yaml.output.outputVariables.PAYLOAD>
+                    - name: update_payload
+                      description: New Template Payload
+                      type: String
+                      value: <+execution.steps.Download_and_Analyze.steps.Update_References_in_YAML.output.outputVariables.MODIFIED_JSON>
+              - stepGroup:
+                  name: Promotion and Upgrades
+                  identifier: Promotion_and_Upgrades
+                  steps:
+                    - step:
+                        type: ShellScript
+                        name: Build New Querystring
+                        identifier: Build_New_Querystring
+                        spec:
+                          shell: Bash
+                          executionTarget: {}
+                          source:
+                            type: Inline
+                            spec:
+                              script: |
+                                set -eo pipefail
+                                echo "Preparing Query String"
+                                if [[ ${PROJECT_ID} ]]; then
+                                  if [[ -z ${ORG_ID} ]]; then
+                                    echo "Organization must be provided if selecting a Project Identifier"
+                                    exit 255
+                                  fi
+                                fi
+                                output_string="/v1"
+                                if [[ ${ORG_ID} ]]; then
+                                  output_string="${output_string}/orgs/${ORG_ID}"
+                                  if [[ ${PROJECT_ID} ]]; then
+                                    output_string="${output_string}/projects/${PROJECT_ID}"
+                                  fi
+                                fi
+                                if [[ ${METHOD} == true ]]; then
+                                  output_string="${output_string}/templates/${TEMPLATE_ID}/versions/${TEMPLATE_VERSION}"
+                                else
+                                  output_string="${output_string}/templates?identifiers=${TEMPLATE_ID}"
+                                fi
+                          environmentVariables:
+                            - name: ACCOUNT_ID
+                              value: <+stepGroup.variables.account_id>
+                              type: String
+                            - name: ORG_ID
+                              value: <+<+pipeline.variables.promote_to> == "org" ?<+stepGroup.variables.organization_id> :"">
+                              type: String
+                            - name: PROJECT_ID
+                              value: <+<+pipeline.variables.promote_to> == "project" ?<+stepGroup.variables.project_id> :"">
+                              type: String
+                            - name: TEMPLATE_ID
+                              value: <+stepGroup.variables.template_id>
+                              type: String
+                            - name: TEMPLATE_VERSION
+                              value: <+stepGroup.variables.template_version>
+                              type: String
+                            - name: METHOD
+                              value: <+stepGroup.variables.template_exists>
+                              type: String
+                          outputVariables:
+                            - name: QUERYSTRING
+                              type: String
+                              value: output_string
+                        timeout: 10m
+                    - step:
+                        type: Http
+                        name: Upsert Templates in New Scope
+                        identifier: Upsert_Templates_in_New_Scope
+                        spec:
+                          url: <+spec.inputVariables.HARNESS_ENDPOINT><+spec.inputVariables.QUERYSTRING>
+                          method: <+<+stepGroup.variables.template_exists> == "false" ?"POST" :"PUT">
+                          headers:
+                            - key: x-api-key
+                              value: <+stepGroup.variables.harness_platform_key>
+                            - key: Harness-Account
+                              value: <+stepGroup.variables.account_id>
+                            - key: Content-Type
+                              value: application/json
+                          inputVariables:
+                            - name: HARNESS_ENDPOINT
+                              value: <+stepGroup.variables.harness_account_url>
+                              type: String
+                            - name: ACCOUNT_ID
+                              value: <+stepGroup.variables.account_id>
+                              type: String
+                            - name: QUERYSTRING
+                              value: <+stepGroup.steps.Build_New_Querystring.output.outputVariables.QUERYSTRING>
+                              type: String
+                            - name: METHOD
+                              value: <+stepGroup.variables.template_exists>
+                              type: String
+                          requestBody: |-
+                            {
+                              "template_yaml": "<+stepGroup.variables.current_payload>",
+                              "is_stable": true,
+                              "comments": "Promoted from Pipeline and Created by Automation"
+                            }
+                          outputVariables:
+                            - name: PAYLOAD
+                              value: <+json.format(httpResponseBody)>
+                              type: String
+                          assertion: <+httpResponseCode>==200||<+httpResponseCode>==201
+                        timeout: 10s
+                  variables:
+                    - name: harness_account_url
+                      type: String
+                      value: <+stage.variables.harness_account_url>
+                      description: ""
+                      required: false
+                    - name: harness_platform_key
+                      type: String
+                      value: <+stage.variables.harness_platform_key>
+                      description: ""
+                      required: false
+                    - name: account_id
+                      description: Provide the Harness Account ID associated with the provided Platform Key
+                      type: String
+                      value: <+stage.variables.harness_platform_account>
+                    - name: organization_id
+                      description: Provide the Harness Organization ID from which the Template will be retrieved
+                      type: String
+                      value: <+stage.variables.organization_id>
+                    - name: project_id
+                      description: Provide the Harness Project ID from which the Template will be retrieved
+                      type: String
+                      value: <+stage.variables.project_id>
+                    - name: template_id
+                      description: Provide the Harness Template ID to retrieve
+                      type: String
+                      value: <+stage.variables.template_id>
+                    - name: template_version
+                      description: Provide the Harness Template Version ID to retrieve
+                      type: String
+                      value: <+stage.variables.template_version>
+                    - name: current_payload
+                      description: Current Template Payload
+                      type: String
+                      value: <+execution.steps.Download_and_Analyze.steps.Update_References_in_YAML.output.outputVariables.CONVERTED_STRING>
+                    - name: template_exists
+                      description: Does the template exist in scope?
+                      type: String
+                      value: <+execution.steps.Promotion_Conflict_Handler.steps.Verify_Template_and_Version.output.outputVariables.TEMPLATE_FOUND>
+        tags: {}
+        variables:
+          - name: harness_account_url
+            type: String
+            description: ""
+            required: false
+            value: <+pipeline.variables.harness_account_url>
+          - name: harness_platform_key
+            type: String
+            description: ""
+            required: false
+            value: <+pipeline.variables.harness_platform_key>
+          - name: harness_platform_account
+            type: String
+            description: ""
+            required: false
+            value: <+pipeline.variables.harness_platform_account>
+          - name: organization_id
+            type: String
+            description: ""
+            required: false
+            value: <+pipeline.variables.org_id>
+          - name: project_id
+            type: String
+            description: ""
+            required: false
+            value: <+pipeline.variables.project_id>
+          - name: template_id
+            type: String
+            description: ""
+            required: false
+            value: <+pipeline.variables.template_id>
+          - name: template_version
+            type: String
+            description: ""
+            required: false
+            value: <+pipeline.variables.template_version>
+          - name: promote_to
+            type: String
+            description: ""
+            required: false
+            value: <+pipeline.variables.promote_to>
+  variables:
+    - name: org_id
+      type: String
+      description: ""
+      required: false
+      value: <+input>
+    - name: project_id
+      type: String
+      description: ""
+      required: false
+      value: <+input>
+    - name: template_id
+      type: String
+      description: ""
+      required: false
+      value: <+input>
+    - name: template_version
+      type: String
+      description: ""
+      required: false
+      value: <+input>
+    - name: promote_to
+      type: String
+      description: ""
+      required: false
+      value: <+input>.allowedValues(account,org)
+    - name: nested_dependency
+      type: String
+      description: ""
+      required: false
+      value: <+input>.default(false).allowedValues(true,false)
+    - name: harness_platform_account
+      type: String
+      description: ""
+      required: false
+      value: <+account.identifier>
+    - name: harness_platform_key
+      type: Secret
+      description: ""
+      required: false
+      value: <+input>
+    - name: harness_account_url
+      type: String
+      description: ""
+      required: false
+      value: https://app.harness.io
+  flowControl:
+    barriers:
+      - name: template_evaluation
+        identifier: template_evaluation
+  fixedInputsOnRerun: true
